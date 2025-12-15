@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Heart Particles & Hand Tracking</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050505; /* Dark background */
+            font-family: sans-serif;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+
+        /* Hide the webcam video element, we only want the data */
+        .input_video {
+            display: none; 
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 1.2rem;
+            pointer-events: none;
+            text-align: center;
+        }
+    </style>
+
+    <!-- Load Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <!-- Load MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading">Allow Webcam access to interact...<br>Loading Models...</div>
+    <video class="input_video"></video>
+    <div id="canvas-container"></div>
+
+    <script>
+        /**
+         * PART 1: THREE.JS SETUP
+         * Sets up the 3D scene, camera, and renderer.
+         */
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        
+        // Camera setup
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 300;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        /**
+         * PART 2: GENERATE HEART TEXTURE
+         * Creates a heart shape programmatically on a canvas to use as a particle texture.
+         */
+        function createHeartTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32;
+            canvas.height = 32;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#ff4d6d'; // Pinkish Red
+            context.beginPath();
+            // Draw Heart Shape
+            const topCurveHeight = 10;
+            context.moveTo(16, 10);
+            context.bezierCurveTo(16, 9, 14, 0, 8, 0);
+            context.bezierCurveTo(-2, 0, -2, 14, 16, 30);
+            context.bezierCurveTo(34, 14, 34, 0, 24, 0);
+            context.bezierCurveTo(18, 0, 16, 9, 16, 10);
+            context.closePath();
+            context.fill();
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        /**
+         * PART 3: PARTICLE SYSTEM
+         * Generates points in a heart shape and stores their "home" positions.
+         */
+        const particleCount = 2500;
+        const geometry = new THREE.BufferGeometry();
+        const positions = [];
+        const originalPositions = []; // To store where particles "want" to go back to
+
+        // Parametric equation for a heart shell
+        // x = 16sin^3(t)
+        // y = 13cos(t) - 5cos(2t) - 2cos(3t) - cos(4t)
+        for (let i = 0; i < particleCount; i++) {
+            // Random angle t
+            const t = Math.random() * Math.PI * 2;
+            // Random spread for volume (creating a thick shell)
+            const spread = 0.5 + Math.random() * 0.5; 
+
+            // Basic 2D heart shape
+            let x = 16 * Math.pow(Math.sin(t), 3);
+            let y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+            
+            // Add Z-depth (make it a puffy heart)
+            let z = (Math.random() - 0.5) * 10; 
+            
+            // Scale up the heart
+            const scale = 4 * spread;
+            x *= scale;
+            y *= scale;
+            z *= scale;
+
+            // Shift y up slightly to center it
+            y += 10; 
+
+            positions.push(x, y, z);
+            originalPositions.push(x, y, z);
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+
+        const material = new THREE.PointsMaterial({
+            size: 8,
+            map: createHeartTexture(),
+            transparent: true,
+            opacity: 0.9,
+            depthWrite: false, // Prevents particles from occluding each other harshly
+            blending: THREE.AdditiveBlending
+        });
+
+        const particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+
+        /**
+         * PART 4: INTERACTION STATE
+         * Tracks the invisible sphere (hand).
+         */
+        let handPos = new THREE.Vector3(9999, 9999, 0); // Start far away
+        const repulsionRadius = 60; // Size of the invisible sphere
+        const repulsionStrength = 2; // How fast particles move away
+
+        /**
+         * PART 5: ANIMATION LOOP
+         * Updates physics and renders the scene.
+         */
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Access position attributes directly
+            const positions = particles.geometry.attributes.position.array;
+            
+            for (let i = 0; i < particleCount; i++) {
+                const ix = i * 3;
+                const iy = i * 3 + 1;
+                const iz = i * 3 + 2;
+
+                // Current position
+                let px = positions[ix];
+                let py = positions[iy];
+                let pz = positions[iz];
+
+                // Original "Home" position
+                const ox = originalPositions[ix];
+                const oy = originalPositions[iy];
+                const oz = originalPositions[iz];
+
+                // 1. Calculate distance from Hand
+                const dx = px - handPos.x;
+                const dy = py - handPos.y;
+                // We ignore Z distance for interaction to make it feel more responsive on 2D screens
+                const distSq = dx*dx + dy*dy; 
+
+                // 2. Physics: Repulsion
+                if (distSq < repulsionRadius * repulsionRadius) {
+                    const dist = Math.sqrt(distSq);
+                    const force = (repulsionRadius - dist) / repulsionRadius;
+                    
+                    // Push away from hand center
+                    const angle = Math.atan2(dy, dx);
+                    px += Math.cos(angle) * force * 5;
+                    py += Math.sin(angle) * force * 5;
+                } else {
+                    // 3. Physics: Return to Home (Elasticity)
+                    // Linear interpolation (Lerp) back to original
+                    px += (ox - px) * 0.05;
+                    py += (oy - py) * 0.05;
+                    pz += (oz - pz) * 0.05;
+                }
+
+                // Update geometry
+                positions[ix] = px;
+                positions[iy] = py;
+                positions[iz] = pz;
+            }
+
+            particles.geometry.attributes.position.needsUpdate = true;
+            
+            // Slow rotation of the whole heart for effect
+            particles.rotation.y += 0.002;
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        /**
+         * PART 6: HAND TRACKING (MediaPipe)
+         */
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                // Get the first detected hand
+                const hand = results.multiHandLandmarks[0];
+                
+                // Landmark 9 is the middle of the palm (approx center)
+                // Landmark 8 is the index finger tip
+                const point = hand[9]; 
+
+                // Map MediaPipe coordinates (0 to 1) to Three.js World coordinates
+                // Note: Webcam x is mirrored, so we do (1 - point.x)
+                
+                // Calculate visible width/height at the heart's depth (z=0)
+                const vFOV = THREE.MathUtils.degToRad(camera.fov);
+                const height = 2 * Math.tan( vFOV / 2 ) * camera.position.z;
+                const width = height * camera.aspect;
+
+                const targetX = (1 - point.x) * width - (width / 2);
+                const targetY = (1 - point.y) * height - (height / 2);
+
+                // Smoothly update handPos to remove jitter
+                handPos.x += (targetX - handPos.x) * 0.1;
+                handPos.y += (targetY - handPos.y) * 0.1;
+            } else {
+                // If no hand, move sphere away
+                handPos.set(9999, 9999, 0);
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        // Initialize Camera
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        cameraUtils.start();
+
+        /**
+         * PART 7: RESPONSIVENESS
+         * Handle window resizing
+         */
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
